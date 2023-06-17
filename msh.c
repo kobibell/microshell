@@ -1,166 +1,144 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/types.h>
 #include <sys/wait.h>
+#include <limits.h>
 
-#define MSH_TOK_BUFSIZE 64
-#define MSH_TOK_DELIM " \t\r\n\a"
+#define MAX_ARGS 10
 
-// Declare function prototypes
-char *msh_read_line(void);
-char **msh_split_line(char *line);
-int msh_launch(char **args);
-int msh_execute(char **args);
-int msh_cd(char **args);
-int msh_help(char **args);
-int msh_exit(char **args);
-
-// Define builtin commands
-char *builtin_str[] = {
-    "cd",
-    "help",
-    "exit"
-};
-
-int (*builtin_func[]) (char **) = {
-    &msh_cd,
-    &msh_help,
-    &msh_exit
-};
-
-int msh_num_builtins() {
-    return sizeof(builtin_str) / sizeof(char *);
+void builtin_cd(char *path) {
+    if (chdir(path) != 0) {
+        perror("chdir");
+    }
 }
 
-// Implement the read line function
-char *msh_read_line(void) {
-    char *line = NULL;
-    ssize_t bufsize = 0; // have getline allocate a buffer for us
-    getline(&line, &bufsize, stdin);
-    return line;
+void builtin_help() {
+    printf("Microshell (MSH) - Available commands:\n");
+    printf("cd [path] - Change the current directory to [path]\n");
+    printf("help - Display this help message\n");
+    printf("exit - Exit the shell\n");
 }
 
-// Implement the split line function
-char **msh_split_line(char *line) {
-    int bufsize = MSH_TOK_BUFSIZE, position = 0;
-    char **tokens = malloc(bufsize * sizeof(char*));
-    char *token;
+void split_command(char *command, char **args) {
+    int i = 0;
+    args[i] = strtok(command, " ");
+    while (args[i] != NULL && i < MAX_ARGS - 1) {
+        i++;
+        args[i] = strtok(NULL, " ");
+    }
+}
 
-    if (!tokens) {
-        fprintf(stderr, "msh: allocation error\n");
-        exit(EXIT_FAILURE);
+void execute_pipes(char *command) {
+    // Split the command into parts at the pipe symbol
+    char *parts[MAX_ARGS] = {NULL};
+    int num_parts = 0;
+    parts[num_parts] = strtok(command, "|");
+    while (parts[num_parts] != NULL && num_parts < MAX_ARGS - 1) {
+        num_parts++;
+        parts[num_parts] = strtok(NULL, "|");
     }
 
-    token = strtok(line, MSH_TOK_DELIM);
-    while (token != NULL) {
-        tokens[position] = token;
-        position++;
+    // Create a pipe for each pair of commands
+    int pipefd[MAX_ARGS - 1][2];
+    for (int i = 0; i < num_parts - 1; i++) {
+        if (pipe(pipefd[i]) == -1) {
+            perror("pipe");
+            exit(1);
+        }
+    }
 
-        if (position >= bufsize) {
-            bufsize += MSH_TOK_BUFSIZE;
-            tokens = realloc(tokens, bufsize * sizeof(char*));
-            if (!tokens) {
-                fprintf(stderr, "msh: allocation error\n");
-                exit(EXIT_FAILURE);
+    // Create a new process for each part of the command
+    pid_t pids[MAX_ARGS];
+    for (int i = 0; i < num_parts; i++) {
+        pids[i] = fork();
+        if (pids[i] == 0) {
+            // Child process
+            if (i < num_parts - 1) {
+                close(pipefd[i][0]); // Close the read end of the current pipe
+                dup2(pipefd[i][1], STDOUT_FILENO); // Redirect stdout to the write end of the current pipe
+                close(pipefd[i][1]);
+            }
+            if (i > 0) {
+                close(pipefd[i - 1][1]); // Close the write end of the previous pipe
+                dup2(pipefd[i - 1][0], STDIN_FILENO); // Redirect stdin to the read end of the previous pipe
+                close(pipefd[i - 1][0]);
+            }
+
+            // Split the command into arguments and execute it
+            char *args[MAX_ARGS] = {NULL};
+            split_command(parts[i], args);
+            execvp(args[0], args);
+            perror("execvp");
+            exit(1);
+        }
+    }
+
+    // Close all pipes in the parent process
+    for (int i = 0; i < num_parts - 1; i++) {
+        close(pipefd[i][0]);
+        close(pipefd[i][1]);
+    }
+
+    // Wait for all child processes to finish
+    int status;
+    for (int i = 0; i < num_parts; i++) {
+        waitpid(pids[i], &status, 0);
+    }
+}
+
+void execute_command(char *command) {
+    // Check for built-in commands
+    if (strncmp(command, "cd ", 3) == 0) {
+        builtin_cd(command + 3);
+    } else if (strcmp(command, "help") == 0) {
+        builtin_help();
+    } else if (strcmp(command, "exit") == 0) {
+        exit(0);
+    } else {
+        // Check if there's a pipe in the command
+        char *pipe_location = strchr(command, '|');
+        if (pipe_location != NULL) {
+            execute_pipes(command);
+        } else {
+            // Split the command into arguments
+            char *args[MAX_ARGS] = {NULL};
+            split_command(command, args);
+
+            // Create a new process and execute the program with arguments
+            pid_t pid = fork();
+            if (pid == 0) {
+                // Child process
+                execvp(args[0], args);
+                perror("execvp");
+                exit(1);
+            } else if (pid > 0) {
+                // Parent process
+                int status;
+                waitpid(pid, &status, 0);
+            } else {
+                perror("fork");
+                exit(1);
             }
         }
-
-        token = strtok(NULL, MSH_TOK_DELIM);
     }
-    tokens[position] = NULL;
-    return tokens;
 }
 
-// Implement the launch function
-int msh_launch(char **args) {
-    pid_t pid, wpid;
-    int status;
 
-    pid = fork();
-    if (pid == 0) {
-        // Child process
-        if (execvp(args[0], args) == -1) {
-            perror("msh");
-        }
-        exit(EXIT_FAILURE);
-    } else if (pid < 0) {
-        // Error forking
-        perror("msh");
-    } else {
-        // Parent process
-        do {
-            wpid = waitpid(pid, &status, WUNTRACED);
-        } while (!WIFEXITED(status) && !WIFSIGNALED(status));
+int main() {
+    char username[100] = ">cssc1432"; // Replace with your username
+    char input[1024];
+
+    while (1) {
+        printf("%s%% ", username);
+        fgets(input, sizeof(input), stdin);
+
+        // Remove the newline character
+        input[strcspn(input, "\n")] = 0;
+
+        execute_command(input);
     }
-
-    return 1;
-}
-
-// Implement the execute function
-int msh_execute(char **args) {
-    int i;
-
-    if (args[0] == NULL) {
-        // An empty command was entered.
-        return 1;
-    }
-
-    for (i = 0; i < msh_num_builtins(); i++) {
-        if (strcmp(args[0], builtin_str[i]) == 0) {
-            return (*builtin_func[i])(args);
-        }
-    }
-
-    return msh_launch(args);
-}
-
-// Implement the cd function
-int msh_cd(char **args) {
-    if (args[1] == NULL) {
-        fprintf(stderr, "msh: expected argument to \"cd\"\n");
-    } else {
-        if (chdir(args[1]) != 0) {
-            perror("msh");
-        }
-    }
-    return 1;
-}
-
-// Implement the help function
-int msh_help(char **args) {
-    int i;
-    printf("Microshell\n");
-    printf("Type program names and arguments, and hit enter.\n");
-    printf("The following are built in:\n");
-
-    for (i = 0; i < msh_num_builtins(); i++) {
-        printf("  %s\n", builtin_str[i]);
-    }
-
-    printf("Use the man command for information on other programs.\n");
-    return 1;
-}
-
-// Implement the exit function
-int msh_exit(char **args) {
-    return 0;
-}
-
-int main(int argc, char **argv) {
-    char *line;
-    char **args;
-    int status;
-
-    do {
-        printf("cssc1432> ");
-        line = msh_read_line();
-        args = msh_split_line(line);
-        status = msh_execute(args);
-
-        free(line);
-        free(args);
-    } while (status);
 
     return 0;
 }
